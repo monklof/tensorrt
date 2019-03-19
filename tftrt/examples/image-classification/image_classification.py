@@ -17,8 +17,15 @@
 
 import argparse
 import os
+import json
 import tensorflow as tf
 import tensorflow.contrib.tensorrt as trt
+from tensorflow.python.training.session_run_hook import SessionRunArgs
+from tensorflow.python.training.summary_io import SummaryWriterCache
+from tensorflow.core.protobuf import config_pb2
+from tensorflow.python.client import timeline
+from tensorflow.python.platform import gfile
+
 import time
 import numpy as np
 import sys
@@ -30,30 +37,85 @@ import tensorflow.contrib.slim as slim
 import official.resnet.imagenet_main
 from preprocessing import inception_preprocessing, vgg_preprocessing
 
+
 class LoggerHook(tf.train.SessionRunHook):
     """Logs runtime of each iteration"""
-    def __init__(self, batch_size, num_records, display_every):
+    def __init__(self, batch_size, num_records, display_every,
+                 num_warmup_iterations,
+                 enable_profile=False,
+                 profile_sample_steps=10,
+                 profile_threshold_ms=10.0,
+                 profile_output_dir="profile_data",
+                 profile_show_dataflow=True,
+                 profile_show_memory=False):
         self.iter_times = []
         self.display_every = display_every
         self.num_steps = (num_records + batch_size - 1) / batch_size
         self.batch_size = batch_size
+        self.num_warmup_iterations = num_warmup_iterations
+        self.enable_profile = enable_profile
+        self._output_file = os.path.join(profile_output_dir, "timeline-%d-%.2fms.json")
+        self._file_writer = SummaryWriterCache.get(profile_output_dir)
+        self._show_dataflow = profile_show_dataflow
+        self._show_memory = profile_show_memory
+        self._threshold_secs = profile_threshold_ms / 1000.0
+        self._current_step = 0
+        self._sample_steps = profile_sample_steps
 
     def begin(self):
         self.start_time = time.time()
+
+    def before_run(self, run_context):
+        self._request_summary = (
+                self.enable_profile and
+                self._current_step >= self.num_warmup_iterations
+                and not ((self._current_step + 1) % self._sample_steps))
+        opts = (config_pb2.RunOptions(trace_level=config_pb2.RunOptions.FULL_TRACE)
+                if self._request_summary else None)
+
+        return SessionRunArgs({}, options=opts)
 
     def after_run(self, run_context, run_values):
         current_time = time.time()
         duration = current_time - self.start_time
         self.start_time = current_time
         self.iter_times.append(duration)
-        current_step = len(self.iter_times)
-        if current_step % self.display_every == 0:
-            print("    step %d/%d, iter_time(ms)=%.4f, images/sec=%d" % (
-                current_step, self.num_steps, duration * 1000,
-                self.batch_size / self.iter_times[-1]))
+        self._current_step = len(self.iter_times)
+        if self._current_step % self.display_every == 0:
+            last_loop_time = sum(self.iter_times[self._current_step-self.display_every:])
+
+            print("    step %d/%d, iter_time(ms)=%.4f, images/sec=%.2f;\t"
+                  "last %d: iter_time(s)=%.4f, images/sec=%.2f" % (
+                self._current_step, self.num_steps, duration * 1000,
+                self.batch_size / self.iter_times[-1],
+                self.display_every, last_loop_time,
+                self.batch_size * self.display_every/last_loop_time))
+
+        if self.enable_profile and self._request_summary and \
+                self.iter_times[-1] >= self._threshold_secs:
+            self._save(self._current_step,
+                       self._output_file % (self._current_step,
+                                            self.iter_times[-1]*1000),
+                       run_values.run_metadata.step_stats)
+            self._file_writer.add_run_metadata(run_values.run_metadata,
+                                               "step_%d" % self._current_step)
+
+
+    def _save(self, step, save_path, step_stats):
+        with gfile.Open(save_path, "w") as f:
+            trace = timeline.Timeline(step_stats)
+            f.write(
+                trace.generate_chrome_trace_format(
+                    show_dataflow=self._show_dataflow,
+                    show_memory=self._show_memory))
 
 def run(frozen_graph, model, data_files, batch_size,
-    num_iterations, num_warmup_iterations, use_synthetic=False, display_every=100, run_calibration=False):
+        num_iterations, num_warmup_iterations, use_synthetic=False,
+        display_every=100, run_calibration=False, enable_profile=False,
+        profile_output_dir="trace_log", profile_threshold_ms=30,
+        profile_sample_steps=10, map_num_parallel_calls=13,
+        test_pipeline=False,
+        remove_accuracy=False):
     """Evaluates a frozen graph
     
     This function evaluates a graph on the ImageNet validation set.
@@ -72,13 +134,28 @@ def run(frozen_graph, model, data_files, batch_size,
             input_map={'input': features},
             return_elements=['logits:0', 'classes:0'],
             name='')
-        loss = tf.losses.sparse_softmax_cross_entropy(labels=labels, logits=logits_out)
-        accuracy = tf.metrics.accuracy(labels=labels, predictions=classes_out, name='acc_op')
+        eval_metric_ops = {}
+        if not remove_accuracy:
+            loss = tf.losses.sparse_softmax_cross_entropy(labels=labels, logits=logits_out)
+            eval_metric_ops['accuracy'] = tf.metrics.accuracy(labels=labels, predictions=classes_out, name='acc_op')
+        else:
+            loss = tf.reduce_sum(logits_out)
+            # eval_metric_ops['accuracy'] = (tf.constant(1.0, tf.float32), tf.constant(1.0, tf.float32))
+            eval_metric_ops['accuracy'] = (tf.constant(1.0, tf.float32), tf.constant(1.0, tf.float32))
         if mode == tf.estimator.ModeKeys.EVAL:
             return tf.estimator.EstimatorSpec(
                 mode,
                 loss=loss,
-                eval_metric_ops={'accuracy': accuracy})
+                eval_metric_ops=eval_metric_ops)
+
+    # test
+    def model_fn_test(features, labels, mode):
+        noop = tf.size(features)
+        if mode == tf.estimator.ModeKeys.EVAL:
+            return tf.estimator.EstimatorSpec(
+                mode,
+                loss=noop,
+                eval_metric_ops={'accuracy': (noop, tf.constant(1.0, tf.float32))})
 
     # preprocess function for input data
     preprocess_fn = get_preprocess_fn(model)
@@ -94,20 +171,35 @@ def run(frozen_graph, model, data_files, batch_size,
     def eval_input_fn():
         if use_synthetic:
             input_width, input_height = get_netdef(model).get_input_dims()
-            features = np.random.normal(
+            # features = np.random.normal(
+            #     loc=112, scale=70,
+            #     size=(batch_size, input_height, input_width, 3)).astype(np.float32)
+            # features = np.clip(features, 0.0, 255.0)
+            # features = tf.identity(tf.constant(features))
+            # labels = np.random.randint(
+            #     low=0,
+            #     high=get_netdef(model).get_num_classes(),
+            #     size=(batch_size),
+            #     dtype=np.int32)
+            # labels = tf.identity(tf.constant(labels))
+            feature = np.random.normal(
                 loc=112, scale=70,
-                size=(batch_size, input_height, input_width, 3)).astype(np.float32)
-            features = np.clip(features, 0.0, 255.0)
-            features = tf.identity(tf.constant(features))
-            labels = np.random.randint(
+                size=(input_height, input_width, 3)).astype(np.float32)
+            feature = np.clip(feature, 0.0, 255.0)
+            label = np.random.randint(
                 low=0,
                 high=get_netdef(model).get_num_classes(),
-                size=(batch_size),
                 dtype=np.int32)
-            labels = tf.identity(tf.constant(labels))
+            dataset = tf.data.Dataset.from_tensors((feature, label))
+            dataset = dataset.repeat(num_iterations*batch_size).batch(batch_size)
+            iterator = dataset.make_one_shot_iterator()
+            features, labels = iterator.get_next()
         else:
             dataset = tf.data.TFRecordDataset(data_files)
-            dataset = dataset.apply(tf.contrib.data.map_and_batch(map_func=preprocess_fn, batch_size=batch_size, num_parallel_calls=8))
+            dataset = dataset.apply(tf.contrib.data.map_and_batch(
+                map_func=preprocess_fn,
+                batch_size=batch_size,
+                num_parallel_calls=map_num_parallel_calls))
             dataset = dataset.prefetch(buffer_size=tf.contrib.data.AUTOTUNE)
             dataset = dataset.repeat(count=1)
             iterator = dataset.make_one_shot_iterator()
@@ -115,24 +207,41 @@ def run(frozen_graph, model, data_files, batch_size,
         return features, labels
 
     # Evaluate model
-    logger = LoggerHook(
+    logger_hook = LoggerHook(
         display_every=display_every,
         batch_size=batch_size,
-        num_records=get_tfrecords_count(data_files))
+        num_records=get_tfrecords_count(data_files),
+        num_warmup_iterations=num_warmup_iterations,
+        enable_profile=enable_profile,
+        profile_output_dir=profile_output_dir,
+        profile_threshold_ms=profile_threshold_ms,
+        profile_sample_steps=profile_sample_steps)
+    if run_calibration:
+        hooks = []
+    else:
+        hooks = [logger_hook]
     tf_config = tf.ConfigProto()
     tf_config.gpu_options.allow_growth = True
+    # tf_config.gpu_options.per_process_gpu_memory_fraction = 0.67
+    if test_pipeline:
+        model_fn = model_fn_test
     estimator = tf.estimator.Estimator(
         model_fn=model_fn,
         config=tf.estimator.RunConfig(session_config=tf_config),
         model_dir='model_dir')
-    results = estimator.evaluate(eval_input_fn, steps=num_iterations, hooks=[logger])
-    
+    results = estimator.evaluate(eval_input_fn, steps=num_iterations,
+                                 hooks=hooks)
+
+    if run_calibration:
+        return results
     # Gather additional results
-    iter_times = np.array(logger.iter_times[num_warmup_iterations:])
-    results['total_time'] = np.sum(iter_times)
-    results['images_per_sec'] = np.mean(batch_size / iter_times)
-    results['99th_percentile'] = np.percentile(iter_times, q=99, interpolation='lower') * 1000
-    results['latency_mean'] = np.mean(iter_times) * 1000
+    iter_times = np.array(logger_hook.iter_times[num_warmup_iterations:])
+    results['total_time'] = float(np.sum(iter_times))
+    results['throughput'] = (batch_size * len(iter_times) * 1.0) / results['total_time']
+    results['latency_mean_batch'] = np.mean(iter_times) * 1000
+    results['percentile_99th_batch'] = np.percentile(iter_times, q=99, interpolation='lower') * 1000
+    for k in results:
+        results[k] = float(results[k])
     return results
 
 class NetDef(object):
@@ -493,7 +602,8 @@ def get_frozen_graph(
             print('Calibrating INT8...')
             start_time = time.time()
             run(calib_graph, model, calib_files, batch_size,
-                num_calib_inputs // batch_size, 0, use_synthetic=use_synthetic, run_calibration=True)
+                num_calib_inputs // batch_size, 0, use_synthetic=use_synthetic, run_calibration=True,
+                remove_accuracy=False)
             times['trt_calibration'] = time.time() - start_time
 
             start_time = time.time()
@@ -562,6 +672,16 @@ if __name__ == '__main__':
         help='workspace size in bytes')
     parser.add_argument('--cache', action='store_true',
         help='If set, graphs will be saved to disk after conversion. If a converted graph is present on disk, it will be loaded instead of building the graph again.')
+    parser.add_argument('--remove_accuracy', action='store_true',
+                        help='')
+    parser.add_argument('--profile', action='store_true',
+                        help='')
+    parser.add_argument('--profile_output_dir', type=str, default="trace_log",
+                        help='')
+    parser.add_argument('--profile_threshold_ms', type=float, default=30)
+    parser.add_argument('--profile_sample_steps', type=int, default=10)
+    parser.add_argument('--test_pipeline', action='store_true')
+    parser.add_argument('--map_num_parallel_calls', type=int, default=13)
     args = parser.parse_args()
 
     if args.precision != 'fp32' and not args.use_trt:
@@ -625,12 +745,26 @@ if __name__ == '__main__':
         num_iterations=args.num_iterations,
         num_warmup_iterations=args.num_warmup_iterations,
         use_synthetic=args.use_synthetic,
-        display_every=args.display_every)
+        display_every=args.display_every,
+        enable_profile=args.profile,
+        profile_threshold_ms=args.profile_threshold_ms,
+        profile_output_dir=args.profile_output_dir,
+        profile_sample_steps=args.profile_sample_steps,
+        test_pipeline=args.test_pipeline,
+        map_num_parallel_calls=args.map_num_parallel_calls,
+        remove_accuracy=args.remove_accuracy)
 
     # Display results
     print('results of {}:'.format(args.model))
     print('    accuracy: %.2f' % (results['accuracy'] * 100))
-    print('    images/sec: %d' % results['images_per_sec'])
-    print('    99th_percentile(ms): %.1f' % results['99th_percentile'])
+    print('    throughput: %.2f' % results['throughput'])
+    print('    latency_mean_batch(ms): %.1f' % results['latency_mean_batch'])
+    print('    percentile_99th_batch(ms): %.4f' % results['percentile_99th_batch'])
     print('    total_time(s): %.1f' % results['total_time'])
-    print('    latency_mean(ms): %.1f' % results['latency_mean'])
+    dump_data = {
+        'accuracy': float("%.5f" % results['accuracy']),
+        'throughput': float("%.1f" % results['throughput']),
+        'latency_mean_batch': float('%.2f' % results['latency_mean_batch']),
+        'percentile_99th_batch': float('%.2f' % results['percentile_99th_batch']),
+    }
+    print(json.dumps(dump_data))
